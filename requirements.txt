@@ -1,6 +1,7 @@
 aiofiles
 aiohttp
 beautifulsoup4
+checkdmarc>=5.0
 dnspython
 ipwhois
 requests

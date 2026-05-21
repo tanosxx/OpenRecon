@@ -23,6 +23,7 @@ from . import __version__
 import subprocess
 from ipwhois import IPWhois
 import html
+from .mail_security import analyze_mail_security, render_mail_security
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 console = Console()
@@ -47,22 +48,16 @@ PORT_WORKERS_DEFAULT = 80
 # --------------
 
 def print_banner():
-    console.print("""
- .d88888b.                         8888888b.
-d88P" "Y88b                        888   Y88b
-888     888                        888    888
-888     88888888b.  .d88b. 88888b. 888   d88P .d88b.  .d8888b .d88b. 88888b.
-888     888888 "88bd8P  Y8b888 "88b8888888P" d8P  Y8bd88P"   d88""88b888 "88b
-888     888888  88888888888888  888888 T88b  88888888888     888  888888  888
-Y88b. .d88P888 d88PY8b.    888  888888  T88b Y8b.    Y88b.   Y88..88P888  888
- "Y88888P" 88888P"  "Y8888 888  888888   T88b "Y8888  "Y8888P "Y88P" 888  888
-           888
-           888
-           888
-░█▀▄░█░█░░░█▀▀░█░░░█▀▀░█░█░█▀▀░█▀▄░█▀▀░█▀█░█▀▄
-░█▀▄░░█░░░░█░░░█░░░█▀▀░▀▄▀░█▀▀░█▀▄░█░█░█░█░█░█
-░▀▀░░░▀░░░░▀▀▀░▀▀▀░▀▀▀░░▀░░▀▀▀░▀░▀░▀▀▀░▀▀▀░▀▀░
-""", style="bold white")
+    """Компактный 3-строчный баннер вместо большого ASCII-art."""
+    console.print(
+        f"[bold cyan]┌─ OpenRecon[/] [dim]v{__version__}[/]"
+        f"  [bold white]·[/]  Asynchronous Recon Toolkit"
+        f"  [bold white]·[/]  [dim]by @clevergod[/]"
+    )
+    console.print(
+        "[bold cyan]└─[/] [dim]subdomains · ports · TLS · WAF · "
+        "WHOIS · mail security · security.txt[/]"
+    )
 
 # -----------------
 # Helpers
@@ -84,6 +79,125 @@ def _whois_fetch(domain: str):
     return whois.whois(domain)
 
 
+# Маппинг человеко-читаемых полей → ключи нашей нормализованной структуры.
+# Обрабатываются и стандартные формы ("Domain Name", "Registrar Email"),
+# и .kz-стиль с многоточием ("Domain Name............:", "Email Address......:"),
+# и .ru/RIPE-стиль ("admin-c", "person").
+_WHOIS_CLI_PATTERNS: list[tuple[str, list[str]]] = [
+    ("domain",       [r"domain name", r"domain"]),
+    ("registrar",    [r"current registar", r"sponsoring registrar", r"registrar"]),
+    ("created",      [r"domain created", r"creation date", r"created on", r"created"]),
+    ("expires",      [r"expir(?:y|ation)\s*date", r"registry expiry date", r"expires?",
+                      r"paid-till"]),
+    ("updated",      [r"last modified", r"updated date", r"updated", r"changed"]),
+    ("status",       [r"domain status", r"status"]),
+    ("name",         [r"registrant name", r"registrant",
+                      r"organization using domain name\W+name", r"name"]),
+    ("org",          [r"registrant organization", r"organization name",
+                      r"organisation", r"org"]),
+    ("emails",       [r"registrant email", r"email address", r"e-mail", r"email"]),
+    ("country",      [r"registrant country", r"country"]),
+    ("city",         [r"registrant city", r"city"]),
+    ("state",        [r"registrant state(?:/province)?", r"state(?:/province)?"]),
+    ("postal",       [r"registrant postal code", r"postal code", r"zip"]),
+    ("dnssec",       [r"dnssec"]),
+]
+
+
+def _fallback_whois_via_cli(domain: str) -> dict:
+    """Запасной парсер: вызывает системный `whois <domain>` и регуляркой
+    извлекает основные поля. Нужен для TLD, на которых `python-whois` падает
+    (например `.kz` — дата формата `2023-03-09 12:33:38 (GMT+0:00)`).
+    """
+    import re
+    try:
+        cp = subprocess.run(
+            ["whois", domain], capture_output=True, text=True,
+            timeout=WHOIS_TIMEOUT,
+        )
+        text = cp.stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return {}
+    if not text.strip():
+        return {}
+
+    # Системный whois для многих TLD сперва возвращает ответ IANA про сам TLD
+    # (например для `.kz` сверху идёт блок про домен `KZ` и его админа),
+    # а ниже — данные нужного домена. Эти преамбулы загрязняют парсер.
+    # Поэтому отбрасываем всё до первого маркера ответа реального whois-сервера.
+    cut_markers = [
+        # "Whois Server for the KZ top level domain name."
+        r"(?im)^Whois Server for the [A-Z\.\-]+ top level domain name",
+        # "Domain Name........: cyberone.kz" / "Domain Name: cyberone.kz"
+        rf"(?im)^Domain Name[\.\s]*:\s*{re.escape(domain)}\b",
+        # ".ru/.su/.рф формат: блок начинается с domain: cyberone.kz"
+        rf"(?im)^domain\s*:\s*{re.escape(domain)}\b",
+        # ICANN sections in gTLDs
+        r"(?im)^>>> Last update of WHOIS database",
+    ]
+    earliest = None
+    for pat in cut_markers:
+        m = re.search(pat, text)
+        if m and (earliest is None or m.start() < earliest):
+            earliest = m.start()
+    if earliest is not None and earliest > 0:
+        text = text[earliest:]
+
+    out: dict[str, list[str]] = {k: [] for k, _ in _WHOIS_CLI_PATTERNS}
+    name_servers: list[str] = []
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line.lstrip().startswith(("%", "#", ">>>")):
+            continue
+        # Нормализуем разделитель `Domain Name............: value` → `domain name: value`
+        # Поддерживаем и `key: value`, и `key . . . : value`.
+        m = re.match(r"^\s*([A-Za-z][A-Za-z0-9 /\-_]*?)[\s\.]*:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        key_raw, value = m.group(1).strip().lower(), m.group(2).strip()
+        if not value or value in ("-", "n/a"):
+            continue
+
+        # Name servers — собираем отдельно (множество вариантов имени поля)
+        if re.search(r"name\s*server|nserver|primary server|secondary server", key_raw):
+            ns = value.split()[0].rstrip(".")
+            if ns and ns not in name_servers:
+                name_servers.append(ns)
+            continue
+
+        # Иначе мапим первое совпадение по паттернам в очерёдности
+        for field_name, patterns in _WHOIS_CLI_PATTERNS:
+            if any(re.fullmatch(p, key_raw) for p in patterns):
+                if value not in out[field_name]:
+                    out[field_name].append(value)
+                break
+
+    def _first(field: str) -> str:
+        return out[field][0] if out[field] else "-"
+
+    def _join(field: str) -> str:
+        return ", ".join(out[field]) if out[field] else "-"
+
+    return {
+        "domain": _first("domain") if out["domain"] else domain,
+        "org": _first("org"),
+        "name": _first("name"),
+        "emails": _join("emails"),
+        "registrar": _first("registrar"),
+        "status": _join("status"),
+        "created": _first("created"),
+        "expires": _first("expires"),
+        "updated": _first("updated"),
+        "name_servers": ", ".join(name_servers) if name_servers else "-",
+        "dnssec": _first("dnssec"),
+        "country": _first("country"),
+        "city": _first("city"),
+        "state": _first("state"),
+        "postal": _first("postal"),
+    }
+
+
 def get_whois_info(domain: str) -> dict:
     defaults = {
         'domain': domain,
@@ -91,16 +205,32 @@ def get_whois_info(domain: str) -> dict:
         'created': '-', 'expires': '-', 'updated': '-', 'name_servers': '-', 'dnssec': '-',
         'country': '-', 'city': '-', 'state': '-', 'postal': '-',
     }
+
+    # Считаем dict «пустым» если значимые поля все прочерки.
+    def _is_empty(d: dict) -> bool:
+        meaningful = ('registrar', 'created', 'expires', 'updated',
+                      'name_servers', 'emails', 'name', 'org')
+        return all(d.get(k, '-') in ('-', '', None) for k in meaningful)
+
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(_whois_fetch, domain)
             w = fut.result(timeout=WHOIS_TIMEOUT)
 
         def _fmt(v):
-            if v is None:
+            if v is None or v == '' or v == [] or v == ():
                 return '-'
             if isinstance(v, (list, tuple, set)):
-                return str(sorted(v))
+                # Чистим None/'' внутри коллекций — python-whois иногда отдаёт
+                # `[datetime(...), None, None]`. Берём первый осмысленный.
+                vals = [x for x in v if x not in (None, '', [])]
+                if not vals:
+                    return '-'
+                # Для дат — первое значение (более полезно чем "list of dates")
+                from datetime import datetime as _dtcls
+                if all(isinstance(x, _dtcls) for x in vals):
+                    return str(vals[0])
+                return ", ".join(str(x) for x in vals)
             return str(v)
 
         def _read(wobj, candidates):
@@ -121,7 +251,7 @@ def get_whois_info(domain: str) -> dict:
         # Convert result to a plain dict when possible to avoid surprises in later handling
         raw = w if isinstance(w, dict) else getattr(w, "__dict__", w)
 
-        return {
+        parsed = {
             'domain': _fmt(_read(raw, ['domain_name', 'domain']) or domain),
             'org': _fmt(_read(raw, ['org', 'organization', 'registrant_organization'])),
             'name': _fmt(_read(raw, ['name', 'registrant_name'])),
@@ -138,7 +268,21 @@ def get_whois_info(domain: str) -> dict:
             'state': _fmt(_read(raw, ['state', 'registrant_state', 'province'])),
             'postal': _fmt(_read(raw, ['registrant_postal_code', 'postalcode', 'zip'])),
         }
+        if _is_empty(parsed):
+            # python-whois ничего полезного не достал (но и не упал) —
+            # пробуем системный whois как fallback.
+            fb = _fallback_whois_via_cli(domain)
+            if fb and not _is_empty(fb):
+                return {**parsed, **{k: v for k, v in fb.items()
+                                     if v not in (None, '', '-')}}
+        return parsed
     except Exception:
+        # python-whois взорвался (типичный кейс — .kz из-за нестандартного
+        # формата даты). Идём в CLI-fallback.
+        fb = _fallback_whois_via_cli(domain)
+        if fb and not _is_empty(fb):
+            return {**defaults, **{k: v for k, v in fb.items()
+                                   if v not in (None, '', '-')}}
         return defaults
 
 
@@ -291,35 +435,194 @@ def detect_waf(domain):
         return '-'
 
 
-def export_results(output_path, results):
-    os.makedirs(output_path, exist_ok=True)
-    base_name = os.path.basename(output_path.rstrip("/"))
-    json_path = os.path.join(output_path, f"{base_name}.json")
-    csv_path = os.path.join(output_path, f"{base_name}.csv")
-    txt_path = os.path.join(output_path, f"{base_name}.txt")
+def _ip_whois(ip: str) -> dict:
+    """Возвращает {'ip', 'range', 'owner'} для IP. Приватные RFC1918 помечает явно."""
+    try:
+        first = int(ip.split('.', 1)[0])
+        second = int(ip.split('.', 2)[1])
+        if first == 10:
+            return {'ip': ip,
+                    'range': '10.0.0.0 - 10.255.255.255',
+                    'owner': 'PRIVATE-ADDRESS-ABLK-RFC1918-IANA-RESERVED'}
+        if first == 172 and 16 <= second <= 31:
+            return {'ip': ip,
+                    'range': '172.16.0.0 - 172.31.255.255',
+                    'owner': 'PRIVATE-ADDRESS-BBLK-RFC1918-IANA-RESERVED'}
+        if first == 192 and second == 168:
+            return {'ip': ip,
+                    'range': '192.168.0.0 - 192.168.255.255',
+                    'owner': 'PRIVATE-ADDRESS-CBLK-RFC1918-IANA-RESERVED'}
+    except (ValueError, IndexError):
+        pass
+    try:
+        data = IPWhois(ip).lookup_rdap(depth=1)
+        net = data.get('network') or {}
+        cidr = net.get('cidr') or '-'
+        owner = net.get('name') or data.get('asn_description') or '-'
+        return {'ip': ip, 'range': cidr, 'owner': owner}
+    except Exception:
+        return {'ip': ip, 'range': '-', 'owner': '-'}
 
-    with open(json_path, 'w') as jf:
-        json.dump(results, jf, indent=4)
-    with open(csv_path, 'w', newline='') as cf:
+
+def _collect_ip_whois(ips: list[str], workers: int = 16) -> list[dict]:
+    """Параллельный WHOIS по списку IP — порядок сохраняется."""
+    if not ips:
+        return []
+    results = [None] * len(ips)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_ip_whois, ip): i for i, ip in enumerate(ips)}
+        for fut in concurrent.futures.as_completed(futs):
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception:
+                results[i] = {'ip': ips[i], 'range': '-', 'owner': '-'}
+    return [r for r in results if r is not None]
+
+
+def export_results(
+    output_path: str,
+    domain: str,
+    results: list[dict],
+    sources: dict[str, set[str]],
+    mail_report=None,
+    whois_info: dict | None = None,
+):
+    """Складывает все артефакты в одну папку в стиле скрипта anton.sh.
+
+    Структура:
+        <output_path>/
+            all_subdomains.txt   — все уникальные сабдомены
+            crtsh_subs.txt       — из crt.sh
+            chaos_subs.txt       — из chaos-client (если был)
+            brute_subs.txt       — из wordlist + fallback list
+            alive_subdomains.txt — только живые (ответили 200/301/302/403)
+            sub_ip_map.txt       — sub <TAB> ip
+            unique_ips.txt       — уникальные IP резолва
+            target_networks.txt  — уникальные WHOIS-диапазоны "Range | Owner"
+            whois_report.txt     — per-IP WHOIS строки
+            mail_security.txt    — plain-text дамп блока Mail Security
+            mail_security.json   — структурированный JSON
+            dkim_found.txt       — Anton-style "<selector>._domainkey.<domain> : <txt>"
+            summary.csv          — табличный сводный отчёт
+            summary.json         — полный JSON c результатами сканирования
+            domain_whois.json    — WHOIS основного домена
+    """
+    os.makedirs(output_path, exist_ok=True)
+
+    def _write(name: str, content: str):
+        with open(os.path.join(output_path, name), 'w', encoding='utf-8') as fh:
+            fh.write(content)
+
+    # --- subdomains by source ---
+    for fname, src_key in (
+        ('crtsh_subs.txt', 'crtsh'),
+        ('chaos_subs.txt', 'chaos'),
+        ('brute_subs.txt', 'brute'),
+    ):
+        subs = sorted(sources.get(src_key, set()))
+        if subs:
+            _write(fname, '\n'.join(subs) + '\n')
+
+    all_subs = sorted({s for subs in sources.values() for s in subs})
+    if all_subs:
+        _write('all_subdomains.txt', '\n'.join(all_subs) + '\n')
+
+    # --- alive + sub<->ip mapping ---
+    alive_lines = [r['domain'] for r in results if r.get('alive') == '✅']
+    if alive_lines:
+        _write('alive_subdomains.txt', '\n'.join(sorted(alive_lines)) + '\n')
+
+    sub_ip_lines = [
+        f"{r['domain']}\t{r['ip_plain']}"
+        for r in results if r.get('ip_plain') and r['ip_plain'] != '-'
+    ]
+    if sub_ip_lines:
+        _write('sub_ip_map.txt', '\n'.join(sorted(sub_ip_lines)) + '\n')
+
+    unique_ips = sorted({
+        r['ip_plain'] for r in results
+        if r.get('ip_plain') and r['ip_plain'] != '-'
+    })
+    if unique_ips:
+        _write('unique_ips.txt', '\n'.join(unique_ips) + '\n')
+
+    # --- WHOIS по каждому уникальному IP (параллельно, RDAP) ---
+    ip_whois_rows = _collect_ip_whois(unique_ips) if unique_ips else []
+    if ip_whois_rows:
+        whois_lines = [
+            f"IP: {r['ip']}\tДиапазон: {r['range']}\tВладелец: {r['owner']}"
+            for r in ip_whois_rows
+        ]
+        _write('whois_report.txt', '\n'.join(whois_lines) + '\n')
+        # Уникальные диапазоны
+        net_set = sorted({f"Диапазон: {r['range']} | Владелец: {r['owner']}"
+                          for r in ip_whois_rows if r['range'] != '-'})
+        if net_set:
+            _write('target_networks.txt', '\n'.join(net_set) + '\n')
+
+    # --- Mail security артефакты ---
+    if mail_report is not None:
+        from .mail_security import (
+            report_to_text, report_to_dict, dkim_found_lines,
+        )
+        _write('mail_security.txt', report_to_text(mail_report))
+        with open(os.path.join(output_path, 'mail_security.json'), 'w',
+                  encoding='utf-8') as jf:
+            json.dump(report_to_dict(mail_report), jf, indent=2, ensure_ascii=False)
+        dkim_lines = dkim_found_lines(mail_report)
+        if dkim_lines:
+            _write('dkim_found.txt', '\n'.join(dkim_lines) + '\n')
+
+    # --- WHOIS основного домена ---
+    if whois_info:
+        with open(os.path.join(output_path, 'domain_whois.json'), 'w',
+                  encoding='utf-8') as jf:
+            json.dump(whois_info, jf, indent=2, ensure_ascii=False, default=str)
+
+    # --- Сводные таблицы ---
+    with open(os.path.join(output_path, 'summary.json'), 'w', encoding='utf-8') as jf:
+        json.dump(results, jf, indent=2, ensure_ascii=False)
+    with open(os.path.join(output_path, 'summary.csv'), 'w', newline='',
+              encoding='utf-8') as cf:
         writer = csv.writer(cf)
         writer.writerow(['IP', 'Domain', 'Ports', 'Alive', 'Tech', 'WAF'])
         for row in results:
-            writer.writerow([row['ip_plain'], row['domain'], row['ports'], row['alive'], row['tech'], row['waf']])
-    with open(txt_path, 'w') as tf:
-        for row in results:
-            if row['alive'] == '✅':
-                tf.write(f"{row['domain']}\n")
+            writer.writerow([
+                row.get('ip_plain', '-'), row['domain'], row.get('ports', '-'),
+                row.get('alive', '-'), row.get('tech', '-'), row.get('waf', '-'),
+            ])
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--domain', required=True)
     parser.add_argument('-w', '--wordlist')
-    parser.add_argument('-t', '--threads', type=int, default=50)
+    parser.add_argument(
+        '-t', '--threads', type=int, default=RESOLVE_THREADS,
+        help=f'Параллелизм для DNS-резолва сабдоменов (по умолчанию {RESOLVE_THREADS}).',
+    )
     parser.add_argument('-f', '--full', action='store_true')
     parser.add_argument('-o', '--output')
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('-v', '--version', action='version', version=f'%(prog)s {__version__}')
+    # --- Mail security checks (SPF/DKIM/DMARC + MTA-STS, TLS-RPT, BIMI, DNSSEC,
+    #     Open Relay, security.txt) -------------------------------------------
+    parser.add_argument(
+        '--no-mail', action='store_true',
+        help='Отключить блок Mail Security (SPF/DKIM/DMARC и сопутствующие).',
+    )
+    parser.add_argument(
+        '--mail-verbose', action='store_true',
+        help='Показывать полные сырые записи SPF / DMARC / DKIM серым цветом.',
+    )
+    parser.add_argument(
+        '--mail-relay', action='store_true',
+        help=(
+            'Активная проверка open SMTP relay по 25/tcp на каждом MX-хосте '
+            '(делает реальное соединение).'
+        ),
+    )
     args = parser.parse_args()
 
     # Banner & header
@@ -329,6 +632,8 @@ def main():
 
     domain = args.domain
     start_time = time.time()
+    # Пользовательский -t переопределяет дефолт пула резолвера.
+    resolve_threads = max(1, args.threads if args.threads else RESOLVE_THREADS)
 
     # WHOIS + hosting
     whois_info = get_whois_info(domain)
@@ -348,28 +653,52 @@ def main():
     )
     console.print(whois_panel)
 
-    # Subdomain sources
-    subdomains = set(get_crtsh_subdomains(domain))
-    subdomains.update(get_chaos_subdomains(domain))
+    # --- Mail security: SPF/DKIM/DMARC + MTA-STS/TLS-RPT/BIMI/DNSSEC,
+    #     security.txt + (опц.) Open SMTP Relay -----------------------------
+    mail_report = None
+    if not args.no_mail:
+        try:
+            mail_report = analyze_mail_security(
+                domain,
+                verbose=args.mail_verbose,
+                check_relay=args.mail_relay,
+            )
+            render_mail_security(console, mail_report)
+        except Exception as e:
+            if args.debug:
+                console.print(f"[red]Mail security check failed: {e}[/]")
+            mail_report = None
+
+    # --- Subdomain sources (отдельно по источникам для последующего экспорта) -
+    sources: dict[str, set[str]] = {
+        'crtsh': set(get_crtsh_subdomains(domain)),
+        'chaos': set(get_chaos_subdomains(domain)),
+        'brute': set(),
+    }
 
     if args.wordlist:
         try:
             total = sum(1 for _ in open(args.wordlist))
             console.print(f"[blue]Loaded wordlist with {total:,} entries. Processing in batches...[/]")
             for batch in batch_lines(args.wordlist, batch_size=5000):
-                subdomains.update(f"{line}.{domain}" for line in batch)
+                sources['brute'].update(f"{line}.{domain}" for line in batch)
         except Exception as e:
             if args.debug:
                 console.print(f"[red]Error loading wordlist: {e}")
 
-    subdomains.update(f"{s}.{domain}" for s in FALLBACK_SUBS)
-    subdomains = sorted(set(s for s in subdomains if not s.startswith("*")))
+    sources['brute'].update(f"{s}.{domain}" for s in FALLBACK_SUBS)
+
+    # Объединение для последующего резолва
+    subdomains = sorted({
+        s for subs in sources.values() for s in subs
+        if s and not s.startswith("*") and '@' not in s
+    })
 
     # Resolve (fast) & filter unroutable
     results = []
     with Progress() as progress:
         task = progress.add_task("[cyan]Scanning...", total=1)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=RESOLVE_THREADS) as ex:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=resolve_threads) as ex:
             futs = {ex.submit(resolve, s): s for s in subdomains}
             ip_map = {}
             for fut in concurrent.futures.as_completed(futs):
@@ -414,10 +743,17 @@ def main():
 
     console.print(table)
 
-    # Exports
+    # Exports — Anton-style layout: одна папка `recon_<domain>` со всеми артефактами
     if args.output:
-        output_base = os.path.join(args.output, f"{domain}_{datetime.now().strftime('%d.%m.%Y')}")
-        export_results(output_base, results)
+        output_base = os.path.join(
+            args.output,
+            f"recon_{domain}_{datetime.now().strftime('%d.%m.%Y')}",
+        )
+        console.print(f"[bold blue][+] Saving artefacts to:[/] {output_base}")
+        export_results(
+            output_base, domain, results, sources,
+            mail_report=mail_report, whois_info=whois_info,
+        )
 
     elapsed = time.time() - start_time
     console.print(f"\n✅ [bold green]Scanning complete in[/] {int(elapsed // 60):02d}:{int(elapsed % 60):02d} ({len(results)}/{len(subdomains)} subdomains processed)")
